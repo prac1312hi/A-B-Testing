@@ -1,0 +1,92 @@
+"""
+Generates a realistic (synthetic) A/B test dataset for a fictional e-commerce
+site, "ShopNest", testing a new one-page checkout against the old multi-step one.
+
+The data deliberately includes the messiness you see in real experiment logs:
+  - duplicate log rows
+  - users whose group and landing page don't match (logging bugs)
+  - a handful of users exposed to BOTH versions
+so the analysis has a real cleaning step before any statistics.
+
+Run:  python generate_data.py   -> writes data/ab_test_data.csv
+"""
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+rng = np.random.default_rng(42)
+
+N_USERS = 92_000
+START = pd.Timestamp("2026-09-01")
+DAYS = 21
+
+user_id = np.arange(100001, 100001 + N_USERS)
+group = rng.choice(["control", "treatment"], size=N_USERS, p=[0.5, 0.5])
+device = rng.choice(["mobile", "desktop"], size=N_USERS, p=[0.62, 0.38])
+user_type = rng.choice(["new", "returning"], size=N_USERS, p=[0.55, 0.45])
+day = rng.integers(0, DAYS, size=N_USERS)
+seconds = rng.integers(0, 86_400, size=N_USERS)
+timestamp = START + pd.to_timedelta(day, unit="D") + pd.to_timedelta(seconds, unit="s")
+
+# Baseline conversion rates by segment (control)
+base = np.select(
+    [
+        (device == "mobile") & (user_type == "new"),
+        (device == "mobile") & (user_type == "returning"),
+        (device == "desktop") & (user_type == "new"),
+    ],
+    [0.085, 0.125, 0.115],
+    default=0.160,  # desktop returning
+)
+
+# Treatment effect: the one-page checkout helps mobile a lot (fewer screens on
+# a small device), desktop only a little. Small novelty bump in week 1.
+lift = np.where(device == "mobile", 0.016, 0.003)
+novelty = np.where(day < 7, 0.004, 0.0)
+p = np.where(group == "treatment", base + lift + novelty, base)
+converted = rng.random(N_USERS) < p
+
+# Order value (right-skewed, like real revenue); same distribution in both arms
+order_value = np.where(
+    converted,
+    np.round(rng.lognormal(mean=7.2, sigma=0.55, size=N_USERS), 2),  # ~INR 1,500 median
+    0.0,
+)
+
+landing_page = np.where(group == "control", "old_checkout", "new_checkout")
+
+df = pd.DataFrame({
+    "user_id": user_id,
+    "timestamp": timestamp,
+    "group": group,
+    "landing_page": landing_page,
+    "device": device,
+    "user_type": user_type,
+    "converted": converted.astype(int),
+    "revenue": order_value,
+})
+
+# --- Inject realistic data-quality problems ---------------------------------
+# 1) ~0.8% rows where group and page don't match (logging bug)
+idx = rng.choice(df.index, size=int(0.008 * N_USERS), replace=False)
+df.loc[idx, "landing_page"] = np.where(
+    df.loc[idx, "landing_page"] == "old_checkout", "new_checkout", "old_checkout"
+)
+
+# 2) ~0.5% users exposed to both versions (second log row with the other arm)
+both = df.sample(frac=0.005, random_state=7).copy()
+both["group"] = np.where(both["group"] == "control", "treatment", "control")
+both["landing_page"] = np.where(both["group"] == "control", "old_checkout", "new_checkout")
+both["timestamp"] = both["timestamp"] + pd.to_timedelta(rng.integers(60, 3600, len(both)), unit="s")
+
+# 3) ~0.3% exact duplicate rows
+dups = df.sample(frac=0.003, random_state=11)
+
+df = (pd.concat([df, both, dups])
+        .sample(frac=1, random_state=3)
+        .reset_index(drop=True))
+
+out = Path(__file__).parent / "data"
+out.mkdir(exist_ok=True)
+df.to_csv(out / "ab_test_data.csv", index=False)
+print(f"Wrote {len(df):,} rows to {out / 'ab_test_data.csv'}")
